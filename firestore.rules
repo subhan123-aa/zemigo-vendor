@@ -1,0 +1,300 @@
+rules_version = '2';
+
+// ============================================================================
+// Shared ZemiGo Multi-Vendor Firestore Security Rules
+// Applies to the single shared Firebase project used by:
+//   1. ZemiGo Customer App (`zemigo`)
+//   2. ZemiGo Admin Panel (`zemigo-admin`)
+//   3. ZemiGo Vendor Panel (`zemigo-vendor`)
+//
+// Core Security Guarantees:
+//   - Users can NEVER self-assign `role == 'admin'`.
+//   - Vendors can NEVER self-approve (`approvalStatus`), verify (`verified`),
+//     activate (`active`), or alter `commissionRate`.
+//   - Products created or edited by a vendor are forced to `approvalStatus == 'pending'`
+//     and only become visible to customers after an Admin sets `approvalStatus == 'approved'`.
+//   - Vendors can ONLY read/write their own products, store profile, orders,
+//     payouts, and commissions.
+//   - Customers can ONLY read/write their own user profile and orders, and can
+//     NEVER access admin/vendor payouts or commissions.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDocExists() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function currentUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return userDocExists() && currentUserData().role == 'admin';
+    }
+
+    function isVendorOwner(vendorId) {
+      return isSignedIn() && request.auth.uid == vendorId;
+    }
+
+    function isApprovedVendor(vendorId) {
+      return isVendorOwner(vendorId) &&
+        exists(/databases/$(database)/documents/vendors/$(vendorId)) &&
+        get(/databases/$(database)/documents/vendors/$(vendorId)).data.approvalStatus == 'approved' &&
+        get(/databases/$(database)/documents/vendors/$(vendorId)).data.active == true;
+    }
+
+    // ------------------------------------------------------------------------
+    // 1. users/{userId}
+    //    - Admin role is NEVER self-assignable on create or update.
+    // ------------------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+
+      allow create: if isSignedIn() &&
+        request.auth.uid == userId &&
+        request.resource.data.role in ['customer', 'vendor'] &&
+        (!('verified' in request.resource.data) || request.resource.data.verified == false) &&
+        (!('approvalStatus' in request.resource.data) || request.resource.data.approvalStatus == 'pending');
+
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        request.auth.uid == userId &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'role',
+          'status',
+          'verified',
+          'approvalStatus'
+        ])
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 2. vendors/{vendorId}
+    //    - Vendors register with `approvalStatus == 'pending'`, `verified == false`,
+    //      `active == false`.
+    //    - Vendors can NEVER approve themselves or modify protected fields.
+    // ------------------------------------------------------------------------
+    match /vendors/{vendorId} {
+      allow read: if resource.data.approvalStatus == 'approved' ||
+        isVendorOwner(vendorId) ||
+        isAdmin();
+
+      allow create: if isAdmin() || (
+        isVendorOwner(vendorId) &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        request.resource.data.approvalStatus == 'pending' &&
+        request.resource.data.verified == false &&
+        request.resource.data.active == false
+      );
+
+      allow update: if isAdmin() || (
+        isVendorOwner(vendorId) &&
+        request.resource.data.ownerUid == resource.data.ownerUid &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'ownerUid',
+          'approvalStatus',
+          'verified',
+          'active',
+          'commissionRate',
+          'totalSales',
+          'totalOrders',
+          'totalPayoutsPaid',
+          'pendingPayoutBalance',
+          'lastPayoutAmount',
+          'lastPayoutReference',
+          'lastPayoutAt',
+          'rejectionReason',
+          'approvedAt',
+          'approvedBy'
+        ])
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 3. products/{productId}
+    //    - Storefront customers only read `approvalStatus == 'approved'` products.
+    //    - Vendors only read/create/edit/delete their own products (`vendorId == request.auth.uid`).
+    //    - Vendor creates & edits MUST set `approvalStatus == 'pending'`.
+    //    - Only Admin can set `approvalStatus == 'approved'` or `'rejected'`.
+    // ------------------------------------------------------------------------
+    match /products/{productId} {
+      allow read: if resource.data.approvalStatus == 'approved' ||
+        (isSignedIn() && resource.data.vendorId == request.auth.uid) ||
+        isAdmin();
+
+      allow create: if isAdmin() || (
+        isApprovedVendor(request.auth.uid) &&
+        request.resource.data.vendorId == request.auth.uid &&
+        request.resource.data.approvalStatus == 'pending'
+      );
+
+      allow update: if isAdmin() || (
+        isApprovedVendor(request.auth.uid) &&
+        resource.data.vendorId == request.auth.uid &&
+        request.resource.data.vendorId == request.auth.uid &&
+        request.resource.data.approvalStatus == 'pending' &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'approvedAt',
+          'approvedBy',
+          'rejectionReason',
+          'rating',
+          'reviewCount'
+        ])
+      );
+
+      allow delete: if isAdmin() || (
+        isApprovedVendor(request.auth.uid) &&
+        resource.data.vendorId == request.auth.uid
+      );
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. categories/{categoryId}, banners/{bannerId}, coupons/{couponId}
+    //    - Public storefront read; Admin write only.
+    // ------------------------------------------------------------------------
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /banners/{bannerId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /coupons/{couponId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 5. orders/{orderId}
+    //    - Customer accesses only their own orders (`user_id` / `userId`).
+    //    - Vendor accesses only orders belonging to their own vendor account
+    //      (`request.auth.uid in resource.data.vendorIds`, `vendorId`, `vendor_id`, or `vendorUid`).
+    //    - Admin has full access.
+    // ------------------------------------------------------------------------
+    match /orders/{orderId} {
+      allow read: if isAdmin() || (
+        isSignedIn() && (
+          resource.data.user_id == request.auth.uid ||
+          resource.data.userId == request.auth.uid ||
+          resource.data.vendorId == request.auth.uid ||
+          resource.data.vendor_id == request.auth.uid ||
+          resource.data.vendorUid == request.auth.uid ||
+          request.auth.uid in resource.data.vendorIds
+        )
+      );
+
+      allow create: if isSignedIn() && (
+        request.resource.data.user_id == request.auth.uid ||
+        request.resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
+
+      allow update: if isAdmin() || (
+        isApprovedVendor(request.auth.uid) &&
+        (
+          request.auth.uid in resource.data.vendorIds ||
+          resource.data.vendorId == request.auth.uid ||
+          resource.data.vendor_id == request.auth.uid ||
+          resource.data.vendorUid == request.auth.uid
+        ) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'user_id',
+          'userId',
+          'customerUid',
+          'customerPhone',
+          'customerEmail',
+          'vendorIds',
+          'vendorId',
+          'vendor_id',
+          'vendorUid',
+          'total_amount',
+          'totalAmount',
+          'subtotal_mrp',
+          'selling_subtotal',
+          'product_discount',
+          'coupon_code',
+          'coupon_discount',
+          'delivery_charges',
+          'payment',
+          'payment_method',
+          'payment_status'
+        ])
+      ) || (
+        isSignedIn() &&
+        (resource.data.user_id == request.auth.uid || resource.data.userId == request.auth.uid) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'user_id',
+          'userId',
+          'vendorIds',
+          'vendorId',
+          'vendor_id',
+          'vendorUid',
+          'total_amount',
+          'totalAmount',
+          'subtotal_mrp',
+          'selling_subtotal',
+          'product_discount',
+          'coupon_code',
+          'coupon_discount',
+          'delivery_charges',
+          'payment',
+          'payment_method',
+          'payment_status',
+          'shipments'
+        ]) &&
+        (
+          (!('overall_status' in request.resource.data) || request.resource.data.overall_status == resource.data.overall_status || request.resource.data.overall_status == 'cancelled') &&
+          (!('status' in request.resource.data) || request.resource.data.status == resource.data.status || request.resource.data.status == 'cancelled')
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 6. payouts/{payoutId} & commissions/{commissionId}
+    //    - Vendors can ONLY read their own records (`vendorId == request.auth.uid`).
+    //    - Customers cannot read or write.
+    //    - Only Admin can create, update, or delete payouts & commissions.
+    // ------------------------------------------------------------------------
+    match /payouts/{payoutId} {
+      allow read: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.vendorId == request.auth.uid
+      );
+      allow write: if isAdmin();
+    }
+
+    match /commissions/{commissionId} {
+      allow read: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.vendorId == request.auth.uid
+      );
+      allow write: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------------
+    // 7. settings/{docId}
+    //    - Marketplace settings (`settings/marketplace`) readable by signed-in users;
+    //      writable only by Admin.
+    // ------------------------------------------------------------------------
+    match /settings/{docId} {
+      allow read: if isSignedIn() || docId == 'marketplace';
+      allow write: if isAdmin();
+    }
+  }
+}

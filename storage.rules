@@ -1,0 +1,49 @@
+rules_version = '2';
+
+// ============================================================================
+// Shared ZemiGo Firebase Storage Security Rules
+// Ensures:
+//   - Vendors can ONLY upload to their own UID namespace (`zemigo/vendors/{uid}/**`
+//     and `zemigo/products/{uid}/**`).
+//   - Only Admins can upload global marketplace assets (`zemigo/banners/**`,
+//     `zemigo/categories/**`).
+// ============================================================================
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        firestore.exists(/databases/(default)/documents/users/$(request.auth.uid)) &&
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isValidImageUpload() {
+      return request.resource != null &&
+        request.resource.size < 5 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+    }
+
+    // Vendor store logos & branding (isolated per vendor UID)
+    match /zemigo/vendors/{vendorId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if (isSignedIn() && request.auth.uid == vendorId && isValidImageUpload()) || isAdmin();
+    }
+
+    // Vendor product images (isolated per vendor UID)
+    match /zemigo/products/{vendorId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if (isSignedIn() && request.auth.uid == vendorId && isValidImageUpload()) || isAdmin();
+    }
+
+    // Admin-managed marketplace assets (banners, categories, admin product uploads)
+    match /zemigo/{folder}/{fileName} {
+      allow read: if true;
+      allow write: if isAdmin() && isValidImageUpload();
+    }
+  }
+}
